@@ -308,7 +308,7 @@ def unified_trigger(source: AlertSource, lines: List[str], event_id: Optional[st
         state.logger.info(f"触发来源: {source_name}\n{content}")
         
         # 推送 Gotify（强提醒）
-        push_gotify("⚠️ 强震预警", f"来源: {source_name}\n{content}", priority=10)
+        push_gotify("⚠️ 强震预警", f"{content}", priority=10)
     
     # 启动线程执行触发操作
     threading.Thread(target=trigger_operations, daemon=True).start()
@@ -344,10 +344,12 @@ def on_message_jma(ws, message):
             ann = data.get("AnnouncedTime", "")
             eid = str(data.get("EventID", ""))
             
+            # 调整消息格式和顺序
             lines = [
                 f"地点: {place}",
                 f"最大震度: {max_intensity}",
                 f"震级: M{mag}   深度: {depth} km",
+                f"来源: 日本气象厅 (JMA)",
                 f"发布时间: {ann}",
                 f"事件ID: {eid}"
             ]
@@ -387,17 +389,19 @@ def on_message_cea(ws, message):
             
         # 检查是否达到阈值
         if epi_val >= state.config.trigger_cea_intensity:
+            # 调整消息格式和顺序
             lines = [
                 f"地点: {place}",
-                f"预估烈度: {epi_val}",
+                f"预估烈度: {epi_val:.1f}",
                 f"震级: M{mag}   深度: {depth} km",
+                f"来源: 中国地震预警网 (CEA)",
                 f"发震时刻: {shock}",
                 f"事件ID: {eid}"
             ]
             
             unified_trigger(AlertSource.CEA, lines, eid)
         else:
-            state.logger.info(f"CEA 更新：烈度 {epi_val} (< {state.config.trigger_cea_intensity})")
+            state.logger.info(f"CEA 更新：烈度 {epi_val:.1f} (< {state.config.trigger_cea_intensity})")
             
     except json.JSONDecodeError as e:
         state.logger.error(f"CEA JSON解析错误: {e}")
