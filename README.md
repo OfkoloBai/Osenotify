@@ -59,7 +59,7 @@ export QUAKE_LOG_DIR="./logs"  # 日志目录
 在代码中找到`DEFAULT_CONFIG`部分，修改以下参数：
 
 
-```
+```python
 DEFAULT_CONFIG = AppConfig(
     cooldown=360,  # 冷却时间(秒)
     trigger_jma_intensity="5弱",  # JMA触发阈值
