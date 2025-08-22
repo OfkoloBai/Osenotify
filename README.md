@@ -58,7 +58,6 @@ export QUAKE_LOG_DIR="./logs"  # 日志目录
 
 在代码中找到`DEFAULT_CONFIG`部分，修改以下参数：
 
-python
 
 ```
 DEFAULT_CONFIG = AppConfig(
