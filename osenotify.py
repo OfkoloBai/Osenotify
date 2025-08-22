@@ -2,7 +2,7 @@
 地震速报监听程序 - Osenotify
 监听日本气象厅(JMA)和中国地震预警网(CEA)的地震预警信息
 当检测到达到设定阈值的地震时，自动通过Gotify推送通知
-去除OBS录制、Windows特定功能，适配云服务器环境
+适配云服务器环境
 """
 import os
 import json
