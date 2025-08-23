@@ -15,7 +15,7 @@ from typing import Optional, Dict, Any, List, Callable, Set
 from logging.handlers import RotatingFileHandler
 from enum import Enum, auto
 from pathlib import Path
-from flask import Flask
+from flask import Flask, jsonify
 import threading
 import glob  # 添加到导入部分
 
@@ -87,7 +87,7 @@ class AppConfig:
 
 # 默认配置（调整为云服务器环境，添加Gotify配置）
 DEFAULT_CONFIG = AppConfig(
-    cooldown=int(os.environ.get('QUAKE_COOLDOWN', 360)),
+    cooldown=int(os.environ.get('QUAKE_COOLDOWN', 60)),
     trigger_jma_intensity=os.environ.get('QUAKE_TRIGGER_JMA_INTENSITY', "5弱"),
     trigger_cea_intensity=float(os.environ.get('QUAKE_TRIGGER_CEA_INTENSITY', 7.0)),
     gotify_url=os.environ.get('QUAKE_GOTIFY_URL', "http://your.gotify.server:port"),
@@ -111,6 +111,12 @@ class GlobalState:
         self.logger: Optional[logging.Logger] = None
         self.lock = threading.Lock()  # 添加线程锁
         
+        # WebSocket连接状态
+        self.jma_last_message_time = 0.0
+        self.cea_last_message_time = 0.0
+        self.jma_connected = False
+        self.cea_connected = False
+        
     def is_in_cooldown(self) -> bool:
         """检查是否处于冷却时间内"""
         return time.time() - self.last_trigger_time < self.config.cooldown
@@ -126,6 +132,37 @@ class GlobalState:
     def is_event_triggered(self, event_id: str) -> bool:
         """检查事件是否已触发过"""
         return event_id in self.triggered_event_ids
+    
+    def update_jma_status(self, connected: bool = None):
+        """更新JMA连接状态"""
+        with self.lock:
+            if connected is not None:
+                self.jma_connected = connected
+            if connected:
+                self.jma_last_message_time = time.time()
+    
+    def update_cea_status(self, connected: bool = None):
+        """更新CEA连接状态"""
+        with self.lock:
+            if connected is not None:
+                self.cea_connected = connected
+            if connected:
+                self.cea_last_message_time = time.time()
+    
+    def get_status(self) -> Dict[str, Any]:
+        """获取程序状态信息"""
+        with self.lock:
+            return {
+                "program_state": self.program_state.name,
+                "monitoring_enabled": self.monitoring_enabled,
+                "in_cooldown": self.is_in_cooldown(),
+                "cooldown_remaining": max(0, self.config.cooldown - (time.time() - self.last_trigger_time)),
+                "jma_connected": self.jma_connected,
+                "cea_connected": self.cea_connected,
+                "jma_last_message": time.time() - self.jma_last_message_time if self.jma_last_message_time > 0 else None,
+                "cea_last_message": time.time() - self.cea_last_message_time if self.cea_last_message_time > 0 else None,
+                "triggered_events_count": len(self.triggered_event_ids)
+            }
     
     def cleanup(self):
         """清理资源"""
@@ -318,6 +355,9 @@ def unified_trigger(source: AlertSource, lines: List[str], event_id: Optional[st
 # =========================
 def on_message_jma(ws, message):
     """处理JMA WebSocket消息"""
+    # 更新最后消息时间
+    state.update_jma_status(True)
+    
     if not state.monitoring_enabled:
         return
         
@@ -365,6 +405,9 @@ def on_message_jma(ws, message):
 
 def on_message_cea(ws, message):
     """处理CEA WebSocket消息"""
+    # 更新最后消息时间
+    state.update_cea_status(True)
+    
     if not state.monitoring_enabled:
         return
         
@@ -408,17 +451,48 @@ def on_message_cea(ws, message):
     except Exception as e:
         state.logger.error(f"CEA 解析错误: {e}")
 
-def ws_loop(name: str, url: str, handler: Callable):
+def on_error_jma(ws, error):
+    """处理JMA WebSocket错误"""
+    state.logger.error(f"JMA WebSocket错误: {error}")
+    state.update_jma_status(False)
+
+def on_error_cea(ws, error):
+    """处理CEA WebSocket错误"""
+    state.logger.error(f"CEA WebSocket错误: {error}")
+    state.update_cea_status(False)
+
+def on_close_jma(ws, close_status_code, close_msg):
+    """处理JMA WebSocket关闭"""
+    state.logger.info(f"JMA WebSocket连接关闭: {close_status_code} - {close_msg}")
+    state.update_jma_status(False)
+
+def on_close_cea(ws, close_status_code, close_msg):
+    """处理CEA WebSocket关闭"""
+    state.logger.info(f"CEA WebSocket连接关闭: {close_status_code} - {close_msg}")
+    state.update_cea_status(False)
+
+def on_open_jma(ws):
+    """处理JMA WebSocket打开"""
+    state.logger.info("JMA WebSocket连接已建立")
+    state.update_jma_status(True)
+
+def on_open_cea(ws):
+    """处理CEA WebSocket打开"""
+    state.logger.info("CEA WebSocket连接已建立")
+    state.update_cea_status(True)
+
+def ws_loop(name: str, url: str, handler: Callable, 
+           on_open: Callable, on_error: Callable, on_close: Callable):
     """WebSocket连接循环（带自动重连）"""
     while state.program_state != ProgramState.STOPPING:
         try:
             ws = websocket.WebSocketApp(
                 url,
                 on_message=handler,
-                on_error=lambda _ws, err: state.logger.error(f"{name} 错误: {err}"),
-                on_close=lambda _ws, code, msg: state.logger.info(f"{name} 关闭: {code} {msg}")
+                on_error=on_error,
+                on_close=on_close,
+                on_open=on_open
             )
-            ws.on_open = lambda _ws: state.logger.info(f"已连接 {name}")
             ws.run_forever(ping_interval=25, ping_timeout=10)
         except Exception as e:
             state.logger.error(f"{name} run_forever 异常: {e}")
@@ -462,13 +536,13 @@ def main():
     # 启动两个 WS 线程
     jma_thread = threading.Thread(
         target=ws_loop, 
-        args=("JMA", state.config.ws_jma, on_message_jma), 
+        args=("JMA", state.config.ws_jma, on_message_jma, on_open_jma, on_error_jma, on_close_jma), 
         daemon=True
     )
     
     cea_thread = threading.Thread(
         target=ws_loop, 
-        args=("CEA", state.config.ws_cea, on_message_cea), 
+        args=("CEA", state.config.ws_cea, on_message_cea, on_open_cea, on_error_cea, on_close_cea), 
         daemon=True
     )
     
@@ -487,17 +561,68 @@ def main():
         state.program_state = ProgramState.STOPPING
         state.cleanup()
 
+# =========================
+# Flask健康检查服务器
+# =========================
 app = Flask(__name__)
 
 @app.route('/health')
 def health_check():
-    return 'OK', 200
+    """健康检查端点"""
+    status = state.get_status()
+    
+    # 检查WebSocket连接状态
+    jma_ok = status["jma_connected"] and (status["jma_last_message"] is None or status["jma_last_message"] < 300)  # 5分钟内收到消息
+    cea_ok = status["cea_connected"] and (status["cea_last_message"] is None or status["cea_last_message"] < 300)  # 5分钟内收到消息
+    
+    # 整体健康状态
+    overall_health = status["program_state"] == "RUNNING" and jma_ok and cea_ok
+    
+    response = {
+        "status": "healthy" if overall_health else "unhealthy",
+        "timestamp": datetime.now().isoformat(),
+        "details": status
+    }
+    
+    return jsonify(response), 200 if overall_health else 503
+
+@app.route('/status')
+def status_check():
+    """状态检查端点，返回更详细的信息"""
+    status = state.get_status()
+    response = {
+        "status": "running",
+        "timestamp": datetime.now().isoformat(),
+        "monitoring_enabled": status["monitoring_enabled"],
+        "cooldown_remaining": status["cooldown_remaining"],
+        "jma_connected": status["jma_connected"],
+        "cea_connected": status["cea_connected"],
+        "jma_last_message_seconds_ago": status["jma_last_message"],
+        "cea_last_message_seconds_ago": status["cea_last_message"],
+        "triggered_events_count": status["triggered_events_count"]
+    }
+    return jsonify(response), 200
+
+@app.route('/test-gotify')
+def test_gotify():
+    """测试Gotify推送功能"""
+    try:
+        test_title = "连通性测试"
+        test_message = f"地震监控服务正常运行 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        push_gotify(test_title, test_message, priority=1)
+        return jsonify({"status": "success", "message": "Gotify测试推送已发送"}), 200
+    except Exception as e:
+        return jsonify({"status": "error", "message": f"Gotify测试失败: {str(e)}"}), 500
 
 def run_health_server():
+    """运行健康检查服务器"""
     app.run(host='0.0.0.0', port=5000)
 
-# 在主程序启动时启动健康检查服务器
+# 程序入口
 if __name__ == "__main__":
+    # 启动健康检查服务器线程
     health_thread = threading.Thread(target=run_health_server, daemon=True)
     health_thread.start()
+    
+    # 启动主程序
     main()
